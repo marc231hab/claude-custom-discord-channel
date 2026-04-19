@@ -6,7 +6,9 @@ This project gives you one Discord-bound MCP channel server per Claude Code tmux
 
 - Uses a custom MCP channel server instead of the shared official Discord plugin
 - Forwards messages from exactly one Discord channel into one Claude Code session
+- Forwards any attachments on those messages, inlined into the message text as `[Attachment: name | mime-type | sizeKB | url]` lines
 - Exposes a reply tool so Claude can answer back into that same channel
+- Exposes a download tool so Claude can fetch attachment URLs to local files and then Read them (images are read multimodally, so screenshots work)
 - Lets you run one tmux session per project without cross-talk
 
 ## Files
@@ -95,6 +97,25 @@ claude --dangerously-load-development-channels server:custom-discord
 ```
 
 That is expected for custom channels during preview.
+
+## MCP tools exposed to Claude
+
+- `discord_reply(text, replyToMessageId?)` — sends a message back to the bound Discord channel.
+- `discord_download_attachment(url, filename?)` — downloads an attachment URL (taken from the `[Attachment: ... | url]` line in the forwarded message) into `~/.claude/channels/discord/inbox/<timestamp>-<name>` and returns the local path. Use `Read` on that path afterward (images are multimodal).
+
+## Attachment flow
+
+When a Discord user posts an image, PDF, log file, etc. into the bound channel, the message arrives to Claude like:
+
+```
+<channel source="..." channelId="..." authorId="..." authorName="...">
+Here is the error I'm seeing
+
+[Attachment: error-screenshot.png | image/png | 184.3KB | https://cdn.discordapp.com/attachments/.../error-screenshot.png]
+</channel>
+```
+
+Claude can then call `discord_download_attachment` with that URL to pull it down, and `Read` the local file.
 
 ## Notes
 

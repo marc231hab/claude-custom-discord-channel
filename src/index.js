@@ -2,6 +2,10 @@ import { Client, GatewayIntentBits, Partials } from 'discord.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { appendFileSync, createWriteStream, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import https from 'node:https'
+import http from 'node:http'
 
 function required(name) {
   const value = process.env[name]
@@ -24,6 +28,33 @@ const CHANNEL_NAME = process.env.CHANNEL_NAME || DISCORD_CHANNEL_ID
 
 let targetChannel = null
 const replyToolName = 'discord_reply'
+const downloadToolName = 'discord_download_attachment'
+
+const LOG_DIR = join(process.env.HOME || '/tmp', '.claude', 'channel-logs')
+mkdirSync(LOG_DIR, { recursive: true })
+const LOG_FILE = join(LOG_DIR, `${CHANNEL_NAME}.log`)
+
+const INBOX_DIR = join(process.env.HOME || '/tmp', '.claude', 'channels', 'discord', 'inbox')
+mkdirSync(INBOX_DIR, { recursive: true })
+
+function log(msg) {
+  const line = `[${CHANNEL_NAME}] ${new Date().toISOString()} ${msg}\n`
+  console.error(line.trimEnd())
+  try { appendFileSync(LOG_FILE, line) } catch {}
+}
+
+process.on('uncaughtException', (err) => {
+  log(`UNCAUGHT EXCEPTION: ${err?.stack || err?.message || err}`)
+})
+process.on('unhandledRejection', (reason) => {
+  const detail = reason instanceof Error ? (reason.stack || reason.message) : JSON.stringify(reason)
+  log(`UNHANDLED REJECTION: ${detail}`)
+})
+process.on('exit', (code) => {
+  log(`PROCESS EXIT code=${code}`)
+})
+process.on('SIGTERM', () => { log('SIGTERM received'); process.exit(143) })
+process.on('SIGINT', () => { log('SIGINT received'); process.exit(130) })
 
 const mcp = new Server(
   { name: `discord-${CHANNEL_NAME}`, version: '0.1.0' },
@@ -32,7 +63,7 @@ const mcp = new Server(
       experimental: { 'claude/channel': {} },
       tools: {},
     },
-    instructions: `Messages from the Discord channel plugin arrive as <channel source="${CLAUDE_CHANNEL_SOURCE}" channelId="${DISCORD_CHANNEL_ID}" channelName="${CHANNEL_NAME}" authorId="..." authorName="...">...</channel>. Only messages from the configured Discord channel are forwarded. Use the ${replyToolName} tool to reply back into the same Discord channel.`,
+    instructions: `Messages from the Discord channel plugin arrive as <channel source="${CLAUDE_CHANNEL_SOURCE}" channelId="${DISCORD_CHANNEL_ID}" channelName="${CHANNEL_NAME}" authorId="..." authorName="...">...</channel>. Only messages from the configured Discord channel are forwarded. If the message includes attachments, they appear inside the tag as lines like [Attachment: name | type | size | url]. Use the ${downloadToolName} tool with the url to fetch an attachment to a local file for processing (images, PDFs, logs, etc.). Use the ${replyToolName} tool to reply back into the same Discord channel.`,
   },
 )
 
@@ -51,16 +82,60 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         additionalProperties: false,
       },
     },
+    {
+      name: downloadToolName,
+      description: 'Download a Discord attachment (by URL) to a local file under ~/.claude/channels/discord/inbox. Returns the local path so it can be read by Read/other tools.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'The Discord attachment URL (taken from the [Attachment: ... | url] line in the incoming channel tag).' },
+          filename: { type: 'string', description: 'Optional filename override. Defaults to the URL basename.' },
+        },
+        required: ['url'],
+        additionalProperties: false,
+      },
+    },
   ],
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (request.params.name === downloadToolName) {
+    const { url, filename } = request.params.arguments || {}
+    if (!url || typeof url !== 'string') throw new Error('url is required')
+    const base = (filename || url.split('/').pop().split('?')[0] || 'attachment').replace(/[^\w.\-]/g, '_')
+    const dest = join(INBOX_DIR, `${Date.now()}-${base}`)
+    try {
+      await downloadToFile(url, dest)
+      log(`downloaded attachment ${url} -> ${dest}`)
+      return { content: [{ type: 'text', text: `Downloaded to ${dest}` }] }
+    } catch (err) {
+      log(`DOWNLOAD FAILED: ${err.message}`)
+      throw new Error(`Download failed: ${err.message}`)
+    }
+  }
+
   if (request.params.name !== replyToolName) {
     throw new Error(`Unknown tool: ${request.params.name}`)
   }
 
   if (!targetChannel) {
+    log('REPLY FAILED: targetChannel is null')
     throw new Error('Discord channel is not ready yet')
+  }
+
+  const wsStatus = client.ws?.status
+  const wsReady = client.isReady()
+  log(`reply attempt | ws.status=${wsStatus} isReady=${wsReady} targetChannel=${!!targetChannel}`)
+
+  if (!wsReady) {
+    log('REPLY FAILED: client not ready, attempting re-fetch channel')
+    try {
+      targetChannel = await client.channels.fetch(DISCORD_CHANNEL_ID, { force: true })
+      log(`re-fetch succeeded: ${!!targetChannel}`)
+    } catch (fetchErr) {
+      log(`re-fetch FAILED: ${fetchErr.message}`)
+      throw new Error(`Discord client not ready (ws.status=${wsStatus}) and re-fetch failed: ${fetchErr.message}`)
+    }
   }
 
   const { text, replyToMessageId } = request.params.arguments || {}
@@ -68,23 +143,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     throw new Error('text is required')
   }
 
-  let sent
-  if (replyToMessageId) {
-    sent = await targetChannel.send({
-      content: text,
-      reply: { messageReference: replyToMessageId },
-    })
-  } else {
-    sent = await targetChannel.send(text)
-  }
+  try {
+    let sent
+    if (replyToMessageId) {
+      sent = await targetChannel.send({
+        content: text,
+        reply: { messageReference: replyToMessageId },
+      })
+    } else {
+      sent = await targetChannel.send(text)
+    }
 
-  return {
-    content: [
-      {
-        type: 'text',
-        text: `Sent Discord message ${sent.id}`,
-      },
-    ],
+    log(`reply OK: messageId=${sent.id} (${text.slice(0, 50)}...)`)
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent Discord message ${sent.id}`,
+        },
+      ],
+    }
+  } catch (sendErr) {
+    log(`REPLY SEND FAILED: ${sendErr.message} | code=${sendErr.code} status=${sendErr.status}`)
+    throw new Error(`Discord send failed: ${sendErr.message}`)
   }
 })
 
@@ -103,11 +184,40 @@ const client = new Client({
 client.once('ready', async () => {
   const channel = await client.channels.fetch(DISCORD_CHANNEL_ID)
   if (!channel || !channel.isTextBased()) {
-    console.error(`Configured channel ${DISCORD_CHANNEL_ID} is not a text channel`)
+    log(`FATAL: channel ${DISCORD_CHANNEL_ID} is not a text channel`)
     process.exit(1)
   }
   targetChannel = channel
-  console.error(`Discord channel plugin ready for #${CHANNEL_NAME} (${DISCORD_CHANNEL_ID}) as ${client.user?.tag}`)
+  log(`ready for #${CHANNEL_NAME} (${DISCORD_CHANNEL_ID}) as ${client.user?.tag}`)
+})
+
+// Connection lifecycle logging
+client.on('shardDisconnect', (event, shardId) => {
+  log(`DISCONNECT: shard=${shardId} code=${event.code} reason=${event.reason || 'none'}`)
+})
+
+client.on('shardReconnecting', (shardId) => {
+  log(`RECONNECTING: shard=${shardId}`)
+})
+
+client.on('shardResume', (shardId, replayedEvents) => {
+  log(`RESUMED: shard=${shardId} replayed=${replayedEvents}`)
+})
+
+client.on('shardError', (error, shardId) => {
+  log(`SHARD ERROR: shard=${shardId} error=${error.message}`)
+})
+
+client.on('warn', (msg) => {
+  log(`WARN: ${msg}`)
+})
+
+client.on('error', (error) => {
+  log(`CLIENT ERROR: ${error.message}`)
+})
+
+client.on('invalidated', () => {
+  log('SESSION INVALIDATED — token may be reset or session killed')
 })
 
 client.on('messageCreate', async (message) => {
@@ -117,10 +227,20 @@ client.on('messageCreate', async (message) => {
     if (DISCORD_ALLOWED_USER_IDS.length > 0 && !DISCORD_ALLOWED_USER_IDS.includes(message.author.id)) return
     if (REQUIRE_MENTION && !message.mentions.users.has(client.user.id)) return
 
+    const attachments = [...message.attachments.values()]
+    let content = message.content || ''
+    if (attachments.length > 0) {
+      const lines = attachments.map((att) => {
+        const sizeKB = (att.size / 1024).toFixed(1)
+        return `[Attachment: ${att.name} | ${att.contentType || 'unknown'} | ${sizeKB}KB | ${att.url}]`
+      })
+      content = content ? `${content}\n\n${lines.join('\n')}` : lines.join('\n')
+    }
+
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: {
-        content: message.content || '',
+        content,
         meta: {
           channelId: message.channelId,
           channelName: CHANNEL_NAME,
@@ -131,9 +251,31 @@ client.on('messageCreate', async (message) => {
         },
       },
     })
+    log(`forwarded msg from ${message.author.username}: ${(message.content || '').slice(0, 50)}${attachments.length > 0 ? ` +${attachments.length} attachment(s)` : ''}`)
   } catch (error) {
-    console.error('Failed to forward Discord message to Claude:', error)
+    log(`FORWARD FAILED: ${error.message}`)
   }
 })
+
+function downloadToFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http
+    mod.get(url, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        downloadToFile(res.headers.location, dest).then(resolve).catch(reject)
+        return
+      }
+      if (res.statusCode !== 200) {
+        res.resume()
+        reject(new Error(`HTTP ${res.statusCode}`))
+        return
+      }
+      const file = createWriteStream(dest)
+      res.pipe(file)
+      file.on('finish', () => { file.close(() => resolve(dest)) })
+      file.on('error', reject)
+    }).on('error', reject)
+  })
+}
 
 await client.login(DISCORD_BOT_TOKEN)
