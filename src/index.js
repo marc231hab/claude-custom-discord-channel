@@ -63,7 +63,7 @@ const mcp = new Server(
       experimental: { 'claude/channel': {} },
       tools: {},
     },
-    instructions: `Messages from the Discord channel plugin arrive as <channel source="${CLAUDE_CHANNEL_SOURCE}" channelId="${DISCORD_CHANNEL_ID}" channelName="${CHANNEL_NAME}" authorId="..." authorName="...">...</channel>. Only messages from the configured Discord channel are forwarded. If the message includes attachments, they appear inside the tag as lines like [Attachment: name | type | size | url]. Use the ${downloadToolName} tool with the url to fetch an attachment to a local file for processing (images, PDFs, logs, etc.). Use the ${replyToolName} tool to reply back into the same Discord channel.`,
+    instructions: `Messages from the Discord channel plugin arrive as <channel source="${CLAUDE_CHANNEL_SOURCE}" channelId="${DISCORD_CHANNEL_ID}" channelName="${CHANNEL_NAME}" authorId="..." authorName="...">...</channel>. Only messages from the configured Discord channel are forwarded. If the message includes attachments, they appear inside the tag as lines like [Attachment: name | type | size | url]. Use the ${downloadToolName} tool with the url to fetch an attachment to a local file for processing (images, PDFs, logs, etc.). Use the ${replyToolName} tool to reply back into the same Discord channel — it accepts optional local file paths via the files array to attach images or other files inline.`,
   },
 )
 
@@ -71,14 +71,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: replyToolName,
-      description: 'Send a reply message back to the configured Discord channel.',
+      description: 'Send a reply message back to the configured Discord channel. Optionally attach local files (images, PDFs, etc.) — they are uploaded inline to Discord\'s CDN.',
       inputSchema: {
         type: 'object',
         properties: {
-          text: { type: 'string', description: 'Message text to send to Discord.' },
+          text: { type: 'string', description: 'Message text to send to Discord. Optional when files are provided.' },
           replyToMessageId: { type: 'string', description: 'Optional Discord message id to reply to.' },
+          files: {
+            type: 'array',
+            description: 'Optional list of local absolute file paths to attach. Each file is uploaded to Discord inline. Total upload payload capped at ~25 MB by Discord for non-Nitro bots.',
+            items: { type: 'string' },
+          },
         },
-        required: ['text'],
         additionalProperties: false,
       },
     },
@@ -138,23 +142,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
-  const { text, replyToMessageId } = request.params.arguments || {}
-  if (!text || typeof text !== 'string') {
-    throw new Error('text is required')
+  const { text, replyToMessageId, files } = request.params.arguments || {}
+  const hasFiles = Array.isArray(files) && files.length > 0
+  if ((!text || typeof text !== 'string') && !hasFiles) {
+    throw new Error('text or files is required')
+  }
+  if (hasFiles && !files.every((p) => typeof p === 'string' && p.length > 0)) {
+    throw new Error('files must be an array of non-empty string paths')
   }
 
   try {
-    let sent
-    if (replyToMessageId) {
-      sent = await targetChannel.send({
-        content: text,
-        reply: { messageReference: replyToMessageId },
-      })
-    } else {
-      sent = await targetChannel.send(text)
-    }
+    const payload = {}
+    if (text && typeof text === 'string') payload.content = text
+    if (hasFiles) payload.files = files
+    if (replyToMessageId) payload.reply = { messageReference: replyToMessageId }
 
-    log(`reply OK: messageId=${sent.id} (${text.slice(0, 50)}...)`)
+    const sent = await targetChannel.send(payload)
+
+    const contentPreview = (text || '').slice(0, 50)
+    log(`reply OK: messageId=${sent.id}${hasFiles ? ` +${files.length} file(s)` : ''} (${contentPreview}...)`)
     return {
       content: [
         {
